@@ -1,0 +1,165 @@
+Thiết kế Database cho một Ngân hàng (chia theo Microservice)
+Tài liệu này cung cấp thiết kế cơ sở dữ liệu tham khảo cho một ngân hàng giả định, chia thành các microservice. Bao gồm: phạm vi data ownership, mô tả bảng chính, khóa chính/khóa ngoại, chỉ mục, và sơ đồ ER (Mermaid) để dễ hình dung.
+________________________________________
+Tổng quan kiến trúc
+Mỗi microservice sở hữu riêng database của nó (Database-per-service). Dữ liệu được đồng bộ giữa các service thông qua event-driven (Kafka/Message Broker) hoặc API. Một số service có thể dùng kiểu lưu trữ khác nhau (relational cho transactional, document hoặc timeseries cho logging/analytics).
+Danh sách microservice chính (đề xuất): - Identity/Auth Service - Customer Service - Account Service - Transaction Service - Card Service - Loan Service - KYC / Compliance Service - Clearing & Settlement Service - Notification Service - Audit / Logging Service - Reporting / Analytics Service
+Mỗi service chịu trách nhiệm cho tính toàn vẹn của dữ liệu mình (single source of truth). Giao tiếp giữa các service qua events (e.g., CustomerCreated, AccountOpened, TransactionPosted).
+________________________________________
+1) Identity / Auth Service
+Mục đích: Quản lý user, roles, sessions, MFA. Độc lập với Customer (Customer có thể liên kết tới Identity user).
+DB Type: Relational (Postgres)
+Các bảng chính:
+- users (id PK, username, email, password_hash, status, created_at, updated_at) 
+- user_profiles (user_id PK/FK -> users.id, full_name, dob, address) 
+- roles (id, name) 
+- user_roles (user_id FK, role_id FK, assigned_at) 
+- sessions (id PK, user_id FK, refresh_token_hash, expires_at, created_at) 
+- mfa_methods (id, user_id FK, type, secret_encrypted, created_at)
+Index & constraints: unique on username/email; indexes on user_id for sessions; TTL for sessions cleanup.
+________________________________________
+2) Customer Service
+Mục đích: Thông tin khách hàng (legal entity & individual) - chủ sở hữu thực tế, contacts.
+DB Type: Relational (Postgres)
+Bảng chính: 
+- customers (customer_id PK, customer_type ENUM(individual, corporate), created_at, status) 
+- customer_identifiers (id PK, customer_id FK, id_type, id_value, issued_country, issued_date) 
+- customer_contacts (id PK, customer_id FK, contact_type, value, is_primary) 
+- customer_addresses (id PK, customer_id FK, address_type, street, city, country, postal_code) 
+- customer_relationships (id PK, customer_id, related_customer_id, relation_type)
+Lưu ý: Không lưu các thông tin nhạy cảm chưa mã hóa (PII phải bảo vệ/encrypt-at-rest).
+Mermaid sơ đồ (Customer):
+erDiagram
+    CUSTOMERS ||--o{ CUSTOMER_IDENTIFIERS : has
+    CUSTOMERS ||--o{ CUSTOMER_CONTACTS : has
+    CUSTOMERS ||--o{ CUSTOMER_ADDRESSES : has
+    CUSTOMERS ||--o{ CUSTOMER_RELATIONSHIPS : has
+________________________________________
+3) Account Service
+Mục đích: Quản lý accounts (savings, checking, internal ledgers), balances, account statuses.
+DB Type: Relational with strong transactional support (Postgres, or Oracle)
+Bảng chính: 
+- accounts (account_id PK, customer_id FK (to Customer service via id or denormalized summary), account_type, currency, status, opened_at, closed_at) 
+- ledgers (ledger_id PK, account_id FK, balance_decimal, currency, last_updated) 
+- account_aliases (alias_id PK, account_id FK, alias_type (IBAN, internal), alias_value)
+Important: Không lưu balance history ở bảng accounts. Balances phải được derive từ account_balance_snapshot + transactions/ledger entries.
+erDiagram
+    ACCOUNTS ||--o{ LEDGERS : has
+    ACCOUNTS ||--o{ ACCOUNT_ALIASES : has
+________________________________________
+4) Transaction Service
+Mục đích: Lưu mọi posting đến ledger — ghi chép sự kiện chuyển tiền, debit/credit entries.
+DB Type: Relational (Postgres) hoặc Event Sourcing (Kafka + immutable event store)
+Bảng chính (Relational approach): 
+- transactions (tx_id PK, tx_ref, created_at, status, type (payment, fee, reversal), initiated_by, initiated_at) 
+- transaction_entries (entry_id PK, tx_id FK, account_id FK, entry_type (debit/credit), amount, currency, balance_after, sequence) 
+- transaction_audit (event log for state transitions)
+Properties: - All writes phải trong 1 DB transaction: insert transaksi + entry updates + publish event. - Idempotency key (e.g., tx_ref unique) để chống duplicate.
+Mermaid sơ đồ (Transactions):
+erDiagram
+    TRANSACTIONS ||--o{ TRANSACTION_ENTRIES : contains
+    ACCOUNTS ||--o{ TRANSACTION_ENTRIES : affected_by
+Event-driven pattern: khi transaction confirmed -> emit TransactionPosted event consumed by Account Service to update balances (or Transaction Service updates its own ledger snapshot and Account Service reads it).
+Lưu ý: Chỉ insert transaction, không update
+________________________________________
+5) Card Service
+Mục đích: Quản lý thẻ (debit/credit), authorization logs, blocking.
+DB Type: Relational + Vault for PANs (do not store PANs in plain text)
+Bảng chính: 
+- cards (card_id PK, customer_id, account_id, card_number_token (or PAN id to vault), card_type, status, expiry) 
+- card_auth_requests (auth_id PK, card_id FK, amount, merchant, terminal, response_code, created_at) 
+- card_blocks (id, card_id, reason, blocked_at, unblocked_at)
+Compliance: Tokenize PAN, store in HSM or PCI-compliant vault; logs must be immutable.
+________________________________________
+6) Loan Service
+Mục đích: Quản lý hồ sơ vay, khoản vay, lịch trả nợ, amortization schedule.
+DB Type: Relational
+Bảng chính: 
+- loan_products (product_id, name, terms) 
+- loans (loan_id PK, customer_id, product_id, principal, outstanding_amount, status, start_date, maturity_date) 
+- loan_schedule (schedule_id PK, loan_id FK, due_date, principal_due, interest_due, status) 
+- loan_payments (payment_id PK, loan_id FK, amount, date_posted, source_account)
+________________________________________
+7) KYC / Compliance Service
+Mục đích: Lưu bằng chứng KYC, sanctions checks, AML alerts.
+DB Type: Document DB (MongoDB) hoặc Relational + Blob storage for documents
+Collections / Tables: 
+- kyc_records (customer_id, documents[], checks[], status, last_checked) 
+- aml_alerts (alert_id, customer_id, tx_id, score, disposition, created_at)
+Lưu ý: Audit trail, immutable logs, retention policy.
+________________________________________
+8) Clearing & Settlement Service
+Mục đích: Quản lý settlement batches giữa banks và nội bộ.
+DB Type: Relational
+Bảng chính: 
+- settlement_batches (batch_id, date, status, total_amount, currency) 
+- settlement_entries (entry_id, batch_id FK, tx_id, debit_account, credit_account, amount)
+________________________________________
+9) Notification Service
+Mục đích: Store notification preferences and events (email, sms, push)
+DB Type: Relational or Document DB
+Bảng chính: 
+- notification_preferences (id, customer_id, channel, enabled) 
+- outbox_notifications (id, event_ref, payload, status, attempts, last_attempted_at)
+Pattern: Use Outbox pattern — write to outbox in same TX as domain change, background worker reads outbox and sends notifications.
+________________________________________
+10) Audit / Logging Service
+Mục đích: Immutable audit trail of sensitive operations (money movement, role changes)
+DB Type: Append-only store (Cassandra, Elasticsearch for search, or relational with write-once semantics)
+Fields: event_id, actor_id, target_type, target_id, action, metadata(json), timestamp.
+________________________________________
+11) Reporting / Analytics
+Mục đích: Aggregations, OLAP queries.
+DB Type: Data warehouse (Snowflake/Redshift/BigQuery) or columnar DB; ETL from event streams.
+________________________________________
+Ví dụ DDL (mẫu) — Transaction & Transaction Entries (Postgres)
+CREATE TABLE transactions (
+  tx_id UUID PRIMARY KEY,
+  tx_ref TEXT UNIQUE NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+  status TEXT NOT NULL,
+  type TEXT,
+  initiated_by UUID
+);
+
+CREATE TABLE transaction_entries (
+  entry_id UUID PRIMARY KEY,
+  tx_id UUID NOT NULL REFERENCES transactions(tx_id),
+  account_id UUID NOT NULL,
+  entry_type TEXT CHECK (entry_type IN ('debit','credit')),
+  amount NUMERIC(20,4) NOT NULL,
+  currency CHAR(3) NOT NULL,
+  balance_after NUMERIC(20,4),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE UNIQUE INDEX ux_transactions_tx_ref ON transactions(tx_ref);
+CREATE INDEX ix_transaction_entries_account ON transaction_entries(account_id);
+________________________________________
+Thiết kế dữ liệu: các nguyên tắc quan trọng
+1.	Single source of truth: mỗi entity chủ quản bởi 1 service.
+2.	Event-driven integration: tránh synchronous coupling. Dùng event bus (Kafka/RabbitMQ) + schema registry.
+3.	Idempotency & dedup: mọi consumer xử lý phải idempotent.
+4.	Auditability & immutability: các record về tiền phải có audit trail.
+5.	Partitioning & sharding: phân vùng theo account_id hoặc date cho các bảng lớn (transactions).
+6.	Encryption: encrypt-at-rest cho PII; tokenization cho PAN.
+7.	Retention policies: logs/alerts có TTL, lưu bản tóm tắt nếu cần lâu dài.
+8.	ACID where needed: lồng giao dịch cho những thao tác tài chính; có thể dùng distributed sagas cho những flow cross-service.
+________________________________________
+Data Ownership và Integration Patterns
+•	Outbox pattern: Đảm bảo atomicity giữa DB update và event publish.
+•	Change Data Capture (CDC): Dùng Debezium để stream thay đổi vào Kafka cho reporting.
+•	Materialized views / CQRS: Read models cho performance (separate read DBs).
+________________________________________
+Ví dụ event flow (mở tài khoản + nạp tiền)
+1.	Customer mở yêu cầu mở account -> Account Service tạo accounts record và account_opened event (via outbox).
+2.	Transaction Service nhận event khi có nạp tiền -> tạo transactions + transaction_entries và publish transaction_posted.
+3.	Account Service / Ledger consumer update balance snapshot hoặc rebuild from entries.
+4.	Notification Service consumes events và gửi email/SMS.
+________________________________________
+Gợi ý cấu hình DB & scale
+•	Transactions table: partition by month or by account hash. Use read replicas for reporting.
+•	Archival: sau 1 năm, chuyển transactions cũ sang cold storage (Parquet files) và keep indexes small.
+•	Use connection pooling, statement timeouts, and circuit breakers when calling other services.
+________________________________________
+
